@@ -171,6 +171,7 @@ class PublicKeyInfo():
         
         self.alg = str(algorithm)
         bitstr_key = public_key_info.getComponentByName("subjectPublicKey")
+        self.bitstr_key = bitstr_key # Addition /bratell
         
         if self.alg == "1.2.840.113549.1.1.1":
             self.key = get_RSA_pub_key_material(bitstr_key)
