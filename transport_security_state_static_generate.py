@@ -23,56 +23,9 @@ import sys
 import pyx509.x509_parse as x509_parse
 from pyasn1.codec.der import encoder as der_encoder
 
-### package main
-### 
-### import (
-### 	"bufio"
-### 	"bytes"
-### 	"crypto/sha1"
-### 	"crypto/x509"
-### 	"encoding/base64"
-### 	"encoding/json"
-### 	"encoding/pem"
-### 	"errors"
-### 	"fmt"
-### 	"io"
-### 	"os"
-### 	"regexp"
-### 	"strings"
-### )
-### 
-### // A pin represents an entry in transport_security_state_static.certs. It's a
-### // name associated with a SubjectPublicKeyInfo hash and, optionally, a
-### // certificate.
-### type pin struct {
-### 	name         string
-### 	cert         *x509.Certificate
-### 	spkiHash     []byte
-### 	spkiHashFunc string // i.e. "sha1"
-### }
-### 
-### // preloaded represents the information contained in the
-### // transport_security_state_static.json file. This structure and the two
-### // following are used by the "json" package to parse the file. See the comments
-### // in transport_security_state_static.json for details.
-### type preloaded struct {
-### 	Pinsets []pinset `json:"pinsets"`
-### 	Entries []hsts   `json:"entries"`
-### }
-### 
-### type pinset struct {
-### 	Name    string   `json:"name"`
-### 	Include []string `json:"static_spki_hashes"`
-### 	Exclude []string `json:"bad_static_spki_hashes"`
-### }
-### 
-### type hsts struct {
-### 	Name       string `json:"name"`
-### 	Subdomains bool   `json:"include_subdomains"`
-### 	Mode       string `json:"mode"`
-### 	Pins       string `json:"pins"`
-### }
-### 
+class GenerateException(Exception):
+    pass
+
 def main():
     """The main entry point. Processes arguments and returns 0 if
     successful or 1 if failed."""
@@ -81,10 +34,11 @@ def main():
               file=sys.stderr)
         return 1
 
-    err = process(sys.argv[1], sys.argv[2])
-    if err:
-        print("Conversion failed: %s" % repr(err),
-              file=sys.stderr)
+    try:
+        process(sys.argv[1], sys.argv[2])
+    except GenerateException as e:
+        print("Conversion failed: %s" % str(e), file=sys.stderr)
+        return 1
 
     return 0
 
@@ -111,9 +65,6 @@ def process(jsonFileName, certsFileName):
         writeHSTSOutput(out, preloaded)
         writeFooter(out)
 
-    return None
-
-newLine = "\n"
 startOfCert = "-----BEGIN CERTIFICATE"
 endOfCert = "-----END CERTIFICATE"
 startOfSHA1 = "sha1/"
@@ -125,13 +76,6 @@ nameRegexp = re.compile("[A-Z][a-zA-Z0-9_]*")
 def pemDecode(lines):
     """Decodes a certificate block, assuming it's of the simplest
     possible kind with no headers."""
-    assert lines
-    assert lines[0].startswith(startOfCert)
-    assert lines[-1].startswith(endOfCert)
-    assert len(lines) > 2
-    assert lines[-2] is lines[1:-1][-1]
-    assert lines[1] is lines[1:-1][0]
-
     result = base64.b64decode("\n".join(lines[1:-1]))
     return result
 
@@ -160,17 +104,17 @@ def parseCertsFile(inFile):
         if state == PRENAME:
             name = line
             if not nameRegexp.match(name):
-                raise Exception("invalid name on line %d" % lineNo)
+                raise GenerateException("invalid name on line %d" % lineNo)
             state = POSTNAME
         elif state == POSTNAME:
             if line.startswith(startOfSHA1):
                 try:
                     hash = base64.b64decode(line[len(startOfSHA1):])
                 except TypeError:
-                    raise Exception("failed to decode hash on line %d." %
+                    raise GenerateException("failed to decode hash on line %d." %
                                     lineNo)
                 if len(hash) != 20:
-                    raise Exception("bad SHA1 hash length on line %d." % lineNo)
+                    raise GenerateException("bad SHA1 hash length on line %d." % lineNo)
                 pins.append({"name": name,
                              "spkiHashFunc": "sha1",
                              "spkiHash": hash})
@@ -179,14 +123,12 @@ def parseCertsFile(inFile):
             if line.startswith(startOfCert):
                 pemCert = []
                 pemCert.append(line)
-### 				pemCert = append(pemCert, '\n')
                 state = INCERT
                 continue
-            raise Exception("line %d, after a name, is not a hash nor a certificate" % lineNo)
+            raise GenerateException("line %d, after a name, is not a hash nor a certificate" % lineNo)
         else:
             assert state == INCERT
             pemCert.append(line)
-### 			pemCert = append(pemCert, '\n')
             if not line.startswith(endOfCert):
                 continue
 
@@ -195,14 +137,13 @@ def parseCertsFile(inFile):
             tbs = cert.tbsCertificate
             subject = tbs.subject
             certName = None
-            if "CN" in subject.get_attributes():
-                certName = subject.get_attributes()["CN"][0]
-#            cert = x509.ParseCertificate(block)
-#            certName = cert.Subject.CommonName
+            subj_attrs = subject.get_attributes()
+            if "CN" in subj_attrs:
+                certName = subj_attrs["CN"][0]
             if not certName:
-                certName = subject.get_attributes()["O"][0] + " " + subject.get_attributes()["OU"][0]
+                certName = subj_attrs["O"][0] + " " + subj_attrs["OU"][0]
             if not matchNames(certName, name):
-                raise Exception("name failure on line %d:\n%s -> %s" % (
+                raise GenerateException("name failure on line %d:\n%s -> %s" % (
                         lineNo, certName, name))
             # Calculate SHA1 hash.
             h = hashlib.sha1()
@@ -278,11 +219,11 @@ def checkDuplicatePins(pins):
     for pin in pins:
         name = pin["name"]
         if name in seenNames:
-            raise Exception("duplicate name: %s" % name)
+            raise GenerateException("duplicate name: %s" % name)
         seenNames.add(name)
         hash = pin["spkiHash"]
         if hash in seenHashes:
-            raise Exception("duplicate hash for %s and %s: %s" % (
+            raise GenerateException("duplicate hash for %s and %s: %s" % (
                     name, seenHashes[hash], hash.encode("hex")))
         seenHashes[hash] = name
 
@@ -298,18 +239,18 @@ def checkCertsInPinsets(pinsets, pins):
     for pinset in pinsets:
         name = pinset["name"]
         if name in pinsetNames:
-            raise Exception("duplicate pinset name: %s" % name)
+            raise GenerateException("duplicate pinset name: %s" % name)
         pinsetNames.add(name)
 
         allPinNames = pinset.get("static_spki_hashes", []) + pinset.get("bad_static_spki_hashes", [])
         for pinName in allPinNames:
             if not pinName in allPinNames:
-                raise Exception("unknown pin: %s" % pinName)
+                raise GenerateException("unknown pin: %s" % pinName)
             usedPinNames.add(pinName)
 
     for pinName in pinNames:
         if not pinName in usedPinNames:
-            raise Exception("unused pin: %s" % pinName)
+            raise GenerateException("unused pin: %s" % pinName)
 
 def checkNoopEntries(entries):
     for e in entries:
@@ -317,14 +258,14 @@ def checkNoopEntries(entries):
             if e["name"] == "learn.doubleclick.net":
                 # This entry is deliberately used as an exclusion.
                 continue
-            raise Exception("Entry for " + e["name"] + " has no mode and no pins")
+            raise GenerateException("Entry for " + e["name"] + " has no mode and no pins")
 
 def checkDuplicateEntries(entries):
     seen = set()
     for e in entries:
         name = e["name"]
         if name in seen:
-            raise Exception("Duplicate entry for " + name)
+            raise GenerateException("Duplicate entry for " + name)
         seen.add(name)
 
 def writeHeader(out):
@@ -382,7 +323,7 @@ def toDNS(s):
     parts = []
     for i, label in enumerate(labels):
         if len(label) > 63:
-            raise Exception("DNS label too long")
+            raise GenerateException("DNS label too long")
         parts.append('"\\%03o"' % len(label))
         parts.append('"%s"' % label)
         l += len(label) + 1
@@ -402,7 +343,7 @@ def writeHSTSEntry(out, entry):
     domain = "DOMAIN_NOT_PINNED"
     pinsetName = "kNoPins"
     if entry.get("pins"):
-        pinSetName = "k%sPins" % uppercaseFirstLetter(entry["pins"])
+        pinsetName = "k%sPins" % uppercaseFirstLetter(entry["pins"])
         domain = domainConstant(entry["name"])
     out.write("  {%d, %s, %s, %s, %s, %s },\n" % (dnsLen, str(entry.get("include_subdomains", False)).lower(), dnsName, str(entry.get("mode") == "force-https").lower(), pinsetName, domain))
 
