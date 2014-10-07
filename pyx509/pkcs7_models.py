@@ -171,7 +171,6 @@ class PublicKeyInfo():
         
         self.alg = str(algorithm)
         bitstr_key = public_key_info.getComponentByName("subjectPublicKey")
-        self.bitstr_key = bitstr_key # Addition /bratell
         
         if self.alg == "1.2.840.113549.1.1.1":
             self.key = get_RSA_pub_key_material(bitstr_key)
@@ -557,7 +556,8 @@ class Certificate():
         self.issuer = Name(tbsCertificate.getComponentByName("issuer"))
         self.validity = ValidityInterval(tbsCertificate.getComponentByName("validity"))
         self.subject = Name(tbsCertificate.getComponentByName("subject"))
-        self.pub_key_info = PublicKeyInfo(tbsCertificate.getComponentByName("subjectPublicKeyInfo"))
+        self.raw_pub_key_info = tbsCertificate.getComponentByName("subjectPublicKeyInfo") # Addition /bratell
+        self.pub_key_info = PublicKeyInfo(self.raw_pub_key_info)
         
         issuer_uid = tbsCertificate.getComponentByName("issuerUniqueID")
         if issuer_uid:

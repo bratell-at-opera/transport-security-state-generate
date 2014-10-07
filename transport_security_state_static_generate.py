@@ -206,10 +206,8 @@ def parseCertsFile(inFile):
                         lineNo, certName, name))
             # Calculate SHA1 hash.
             h = hashlib.sha1()
-            rawsubjectpublickeyinfo = der_encoder.encode(tbs.pub_key_info.bitstr_key) # Maybe
-#            print("rawsubjectpublickeyinfo=%s, %s" % (rawsubjectpublickeyinfo.encode("hex"), name))
-            h.update(rawsubjectpublickeyinfo) # This might be wrong. Probably way too decoded. Will be noticed by generating different hashes tham the go program. Or tbs.pub_key_info.key? Or something else?
-                     ### cert.RawSubjectPublicKeyInfo
+            rawsubjectpublickeyinfo = der_encoder.encode(tbs.raw_pub_key_info)
+            h.update(rawsubjectpublickeyinfo)
             pins.append({"name": name,
                          "cert": cert,
                          "spkiHashFunc": "sha1",
