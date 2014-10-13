@@ -292,7 +292,7 @@ def writeDomainIds(out, domainIds):
         out.write("  DOMAIN_" + id + ",\n")
 
     out.write("""\
-  // Boundary value for UMA_HISTOGRAM_ENUMERATION
+  // Boundary value for UMA_HISTOGRAM_ENUMERATION.
   DOMAIN_NUM_EVENTS,
 };
 
@@ -395,7 +395,7 @@ static const char* const kNoRejectedPublicKeys[] = {
         pinsets[pinset["name"]] = pinsetData(pinsetNum, acceptableListName, rejectedListName)
         pinsetNum += 1
 
-    out.write("""\
+    out.write("""
 struct Pinset {
   const char *const *const accepted_pins;
   const char *const *const rejected_pins;
@@ -406,7 +406,7 @@ static const struct Pinset kPinsets[] = {
 
     for pinset in hsts["pinsets"]:
         data = pinsets[pinset["name"]]
-        out.write("  {%s, %s,\n" % (data.acceptPinsVar, data.rejectPinsVar))
+        out.write("  {%s, %s},\n" % (data.acceptPinsVar, data.rejectPinsVar))
 
     out.write("};\n")
 
@@ -446,7 +446,7 @@ static const uint8 kHSTSHuffmanTree[] = {
     huffmanLiteralWriter = cLiteralWriter(out)
     root.WriteTo(huffmanLiteralWriter)
 
-    out.WriteString("""
+    out.write("""
 };
 
 static const uint8 kPreloadedHSTSData[] = {
@@ -461,7 +461,7 @@ static const uint8 kPreloadedHSTSData[] = {
     bitLength = hstsBitWriter.position
     if debugging:
         print("Saved %d bits by using accurate Huffman counts.\n" %
-              origLength-bitLength, file=sys.stderr)
+              (origLength - bitLength), file=sys.stderr)
 
     out.write("""
 };
@@ -489,7 +489,7 @@ class cLiteralWriter(object):
 	else:
             self.out.write(" ")
 
-        self.out.write("0x%0.2x,", b)
+        self.out.write("0x%0.2x," % b)
 	self.bytesThisLine += 1
 	self.count += 1
 
@@ -578,7 +578,7 @@ class bitBuffer(object):
             lastPositionObj[0] = position
             return
 
-        if self.used != -1:
+        if self.used != 0:
             self.elements.append(bitsOrPosition(self.b, self.used, 0))
             self.used = 0
             self.b = 0
@@ -587,8 +587,8 @@ class bitBuffer(object):
         lastPositionObj[0] = position
 
     def WriteChar(self, b, w):
-        bits, ok = w.huffman[ord(b)]
-        assert ok, "WriteChar given rune not in Huffman table"
+        assert ord(b) in w.huffman, "WriteChar given rune not in Huffman table"
+        bits = w.huffman[ord(b)]
         w.huffmanCounts[ord(b)] += 1
         self.WriteBits(bits.bits, bits.numBits)
 
@@ -620,17 +620,9 @@ class reversedEntry(object):
     def __init__(self, bytes, hsts):
         self.hsts = hsts
         self.bytes = bytes
+        assert self.bytes[-1] == "\0"
 
 class reversedEntries(list):
-    def Len(self):
-        return len(self)
-
-    def Less(self, i, j):
-        return self[i].bytes < self[j].bytes
-
-    def Swap(self, i, j):
-        self[i], self[j] = self[j], self[i]
-
     def LongestCommonPrefix(self):
         if len(self) == 0:
             return None
@@ -638,10 +630,10 @@ class reversedEntries(list):
         prefix = ""
         i = 0
         while True:
-            if i > len(self[0].bytes):
+            if i == len(self[0].bytes):
                 break
             candidate = self[0].bytes[i]
-            if candidate == terminalValue:
+            if ord(candidate) == terminalValue:
                 break
             ok = True
 
@@ -661,6 +653,9 @@ class reversedEntries(list):
         for ent in self:
             ent.bytes = ent.bytes[n:]
 
+    def __getslice__(self, i, j):
+        return reversedEntries(list.__getslice__(self, i, j))
+
 def reverseName(name):
     for r in (ord(x) for x in name):
         assert 1 <= r <= 126, "byte in name is out of range."
@@ -672,7 +667,6 @@ def writeEntries(w, hstsEntries):
         ents.append(reversedEntry(reverseName(hstsEntry["name"]),
                                   hstsEntry))
 
-    # Need to check this! Delete the Less method. Delete the Swap method.
     ents.sort(key=lambda x: x.bytes)
 
     return writeDispatchTables(w, ents, 0)
@@ -709,11 +703,12 @@ def writeDispatchTables(w, ents, depth):
     while len(ents) > 0:
         subents = reversedEntries()
         b = ents[0].bytes[0]
-        for j in xrange(1, len(ents)):
+        j = 1
+        while j < len(ents):
             if ents[j].bytes[0] != b:
                 break
+            j += 1
 
-        # This will be by ref. Is that right?
         subents = ents[:j]
         buf.WriteChar(b, w)
 
@@ -722,11 +717,9 @@ def writeDispatchTables(w, ents, depth):
                 print(" ", end="")
             print("?%s" % b)
 
-        if b == terminalValue:
+        if ord(b) == terminalValue:
             assert len(subents) == 1, "multiple values with the same name"
             hsts = ents[0].hsts
-### 			hsts := ents[0].hsts
-            assert False, 'untested?, should it be ents[0]["hsts"]?'
             includeSubdomains = 0
             if hsts.get("include_subdomains"):
                 includeSubdomains = 1
@@ -742,8 +735,7 @@ def writeDispatchTables(w, ents, depth):
             else:
                 buf.WriteBit(1)
                 pinsId = w.pinsets[hsts["pins"]].index
-                assert pinsId < 15, "too many pinsets"
-                assert pinsId < 15, "too many pinsets"
+                assert pinsId < 16, "too many pinsets"
                 buf.WriteBits(pinsId, 4)
                 domainId = w.domainIds[domainConstant(hsts["name"])]
                 assert domainId < 512, "too many domain ids: %d" % domainId
@@ -759,7 +751,7 @@ def writeDispatchTables(w, ents, depth):
 
         ents = ents[j:]
 
-    buf.WriteChar(endOfTableValue, w)
+    buf.WriteChar(chr(endOfTableValue), w)
 
     position = w.position
     buf.WriteTo(w)
@@ -817,7 +809,7 @@ class huffmanNode(object):
             leftValue = int(childPosition / 2)
 
         if self.right.isLeaf():
-            rightValue = 128 < self.right.value
+            rightValue = 128 | self.right.value
         else:
             childPosition = self.right.WriteTo(w)
             assert childPosition < 512, "huffman tree too large"
@@ -830,14 +822,7 @@ class huffmanNode(object):
 
 class nodeList(list):
     """list of huffmanNode objects"""
-    def Len(self):
-        return len(self)
-
-    def Less(self, i, j):
-        return self[i].count < self[j].count
-
-    def Swap(self, i, j):
-        self[i], self[j] = self[j], self[i]
+    pass
 
 # terminalValue indicates the end of a string (which is the beginning of the
 # string since we process it backwards).
@@ -870,22 +855,17 @@ def buildHuffman(useCounts):
             numNonZero += 1
 
     nodes = nodeList()
-#    for _ in range(numNonZero):
-#        nodes.append(None))
-
     for char, count in enumerate(useCounts):
         if count != 0:
             nodes.append(huffmanNode(char, count, None, None))
 
     assert nodes >= 2, "cannot build a tree with a single node"
-    # Need to check this! Delete the Less method. Delete the Swap method.
     nodes.sort(key=lambda x: x.count)
 
     while len(nodes) > 1:
         parent = huffmanNode(0, nodes[0].count + nodes[1].count, nodes[0], nodes[1])
         nodes = nodes[1:]
         nodes[0] = parent
-        # Need to check this! Delete the Less method. Delete the Swap method.
         nodes.sort(key=lambda x: x.count)
 
     return nodes[0]
