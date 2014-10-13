@@ -946,7 +946,7 @@ func reverseName(name string) []byte {
 	return reversed
 }
 
-func writeEntries(w *trieWriter, hstsEntries []hsts) (positin int, err error) {
+func writeEntries(w *trieWriter, hstsEntries []hsts) (position int, err error) {
 	ents := reversedEntries(make([]reversedEntry, len(hstsEntries)))
 
 	for i := range hstsEntries {

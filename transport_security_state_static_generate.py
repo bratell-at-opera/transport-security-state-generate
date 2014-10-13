@@ -61,6 +61,7 @@ def process(jsonFileName, certsFileName):
 
     with open("transport_security_state_static.h", "w") as out:
         writeHeader(out)
+        writeDomainIds(out, preloaded["domain_ids"])
         writeCertsOutput(out, pins)
         writeHSTSOutput(out, preloaded)
         writeFooter(out)
@@ -179,7 +180,7 @@ def matchNames(name, v):
         firstWord = firstWord[:pos]
 
     if not firstWord:
-        printf("First word of certificate name is empty", file=sys.stderr)
+        print("First word of certificate name is empty", file=sys.stderr)
         return False
 
     firstWord = firstWord.lower()
@@ -284,6 +285,19 @@ def writeHeader(out):
 def writeFooter(out):
     out.write("#endif // NET_HTTP_TRANSPORT_SECURITY_STATE_STATIC_H_\n")
 
+def writeDomainIds(out, domainIds):
+    out.write("enum SecondLevelDomainName {\n")
+
+    for id in domainIds:
+        out.write("  DOMAIN_" + id + ",\n")
+
+    out.write("""\
+  // Boundary value for UMA_HISTOGRAM_ENUMERATION
+  DOMAIN_NUM_EVENTS,
+};
+
+""")
+
 def writeCertsOutput(out, pins):
     out.write("""\
 // These are SubjectPublicKeyInfo hashes for public key pinning. The
@@ -338,6 +352,13 @@ def domainConstant(s):
     domain = labels[-2].upper().replace("-", "_")
     return "DOMAIN_%s_%s" % (domain, gtld)
 
+class pinsetData:
+    """index contains the index of the pinset in kPinsets."""
+    def __init__(self, index, acceptPinsVar, rejectPinsVar):
+        self.index = index
+        self.acceptPinsVar = acceptPinsVar
+        self.rejectPinsVar = rejectPinsVar
+
 def writeHSTSEntry(out, entry):
     dnsName, dnsLen = toDNS(entry["name"])
     domain = "DOMAIN_NOT_PINNED"
@@ -358,6 +379,10 @@ static const char* const kNoRejectedPublicKeys[] = {
 };
 
 """)
+
+    pinsets = {}
+    pinsetNum = 0
+
     for pinset in hsts["pinsets"]:
         name = uppercaseFirstLetter(pinset["name"])
         acceptableListName = "k%sAcceptableCerts" % name
@@ -367,30 +392,503 @@ static const char* const kNoRejectedPublicKeys[] = {
         if pinset.get("bad_static_spki_hashes"):
             rejectedListName = "k%sRejectedCerts" % name
             writeListOfPins(out, rejectedListName, pinset["bad_static_spki_hashes"])
-
-        out.write("""\
-#define k%sPins { \\
-  %s, \\
-  %s, \\
-}
-
-""" % (name, acceptableListName, rejectedListName))
+        pinsets[pinset["name"]] = pinsetData(pinsetNum, acceptableListName, rejectedListName)
+        pinsetNum += 1
 
     out.write("""\
-#define kNoPins {\\
-  NULL, NULL, \\
-}
-
-static const struct HSTSPreload kPreloadedSTS[] = {
-""")
-    for entry in hsts["entries"]:
-        writeHSTSEntry(out, entry)
-
-    out.write("""\
+struct Pinset {
+  const char *const *const accepted_pins;
+  const char *const *const rejected_pins;
 };
-static const size_t kNumPreloadedSTS = ARRAYSIZE_UNSAFE(kPreloadedSTS);
+
+static const struct Pinset kPinsets[] = {
+""")
+
+    for pinset in hsts["pinsets"]:
+        data = pinsets[pinset["name"]]
+        out.write("  {%s, %s,\n" % (data.acceptPinsVar, data.rejectPinsVar))
+
+    out.write("};\n")
+
+    # domainIds maps from domainConstant(domain) to an index in kDomainIds.
+    domainIds = {}
+    for i, id in enumerate(hsts["domain_ids"]):
+        domainIds["DOMAIN_" + id] = i
+
+
+    # First, create a Huffman tree using approximate weights and generate
+    # the output using that. During output, the true counts for each
+    # character will be collected for use in building the real Huffman
+    # tree.
+    root = buildHuffman(approximateHuffman(hsts["entries"]))
+    huffmanMap = root.toMap()
+    devNull = open(os.devnull, "w")
+    hstsLiteralWriter = cLiteralWriter(devNull)
+    hstsBitWriter = trieWriter(hstsLiteralWriter, pinsets, domainIds, huffmanMap)
+    writeEntries(hstsBitWriter, hsts["entries"])
+    hstsBitWriter.Close()
+    origLength = hstsBitWriter.position
+
+    # Now that we have the true counts for each character, build the true
+    # Huffman tree.
+    root = buildHuffman(hstsBitWriter.huffmanCounts)
+    huffmanMap = root.toMap()
+
+    out.write("""
+// kHSTSHuffmanTree describes a Huffman tree. The nodes of the tree are pairs
+// of uint8s. The last node in the array is the root of the tree. Each pair is
+// two uint8 values, the first is "left" and the second is "right". If a uint8
+// value has the MSB set then it represents a literal leaf value. Otherwise
+// it's a pointer to the n'th element of the array.
+static const uint8 kHSTSHuffmanTree[] = {
+""")
+
+    huffmanLiteralWriter = cLiteralWriter(out)
+    root.WriteTo(huffmanLiteralWriter)
+
+    out.WriteString("""
+};
+
+static const uint8 kPreloadedHSTSData[] = {
+""")
+
+    hstsLiteralWriter = cLiteralWriter(out)
+    hstsBitWriter = trieWriter(hstsLiteralWriter, pinsets, domainIds, huffmanMap)
+
+    rootPosition = writeEntries(hstsBitWriter, hsts["entries"])
+    hstsBitWriter.Close()
+
+    bitLength = hstsBitWriter.position
+    if debugging:
+        print("Saved %d bits by using accurate Huffman counts.\n" %
+              origLength-bitLength, file=sys.stderr)
+
+    out.write("""
+};
 
 """)
+    out.write("static const unsigned kPreloadedHSTSBits = %d;\n\n" % bitLength)
+    out.write("static const unsigned kHSTSRootPosition = %d;\n\n" %
+              rootPosition)
+
+class cLiteralWriter(object):
+    """cLiteralWriter is an io.Writer that formats data suitable as
+    the contents of a uint8_t array literal in C."""
+    def __init__(self, out):
+        self.out = out
+        self.bytesThisLine = 0
+        self.count = 0
+
+    def WriteByte(self, b):
+        if self.bytesThisLine == 8:
+            self.out.write("\n")
+            self.bytesThisLine = 0
+
+	if self.bytesThisLine == 0:
+            self.out.write("  ")
+	else:
+            self.out.write(" ")
+
+        self.out.write("0x%0.2x,", b)
+	self.bytesThisLine += 1
+	self.count += 1
+
+class trieWriter(object):
+    """trieWriter handles wraps an io.Writer and provides a bit
+    writing interface. It also contains the other information needed
+    for writing out a compressed trie."""
+    def __init__(self, w, pinsets, domainIds, huffman):
+        self.w = w
+        self.pinsets = pinsets # string -> pinsetData
+        self.domainIds = domainIds # string -> int
+        self.huffman = huffman # rune -> bitsAndLen
+        self.b = 0
+        self.used = 0
+        self.position = 0
+        self.huffmanCounts = 129 * [0]
+
+    def WriteBits(self, bits, numBits):
+        for i in xrange(1, numBits + 1):
+            bit = 1 & (bits >> (numBits - i)) # bit #i set or not?
+            self.b |= bit << (7 - self.used)
+            self.used += 1
+            self.position += 1
+            if self.used == 8:
+                self.w.WriteByte(self.b)
+                self.used = 0
+                self.b = 0
+
+    def Close(self):
+        self.w.WriteByte(self.b)
+
+
+class bitsOrPosition(object):
+    """bitsOrPosition contains either some bits (if numBits > 0) or a
+    byte offset in the output (otherwise)."""
+    def __init__(self, bits, numBits, position):
+        self.bits = bits
+        self.numBits = numBits
+        self.position = position
+
+def bitLength(i):
+    numBits = 0
+    while i != 0:
+        numBits += 1
+        i >>= 1
+    return numBits
+
+class bitBuffer(object):
+    """bitBuffer buffers up a series of bits and positions because the
+    final output location of the data isn't known yet and so the
+    deltas from the current position to the written positions isn't
+    known yet."""
+    def __init__(self):
+        self.b = 0
+        self.used = 0
+        self.elements = [] # bitsOrPosition objects.
+
+    def WriteBit(self, bit):
+        self.b |= (bit & 0xff) << (7 - self.used)
+        self.used += 1
+        if self.used == 8:
+            self.elements.append(bitsOrPosition(self.b, self.used, 0))
+            self.used = 0
+            self.b = 0
+
+    def WriteBits(self, bits, numBits):
+        for i in xrange(1, numBits + 1):
+            bit = 1 & (bits >> (numBits - i))
+            self.WriteBit(bit)
+
+    def WritePosition(self, lastPositionObj, position):
+        """lastPositon is an array of one element so that it can be
+        changed by this function. Change to return value?"""
+        if lastPositionObj[0] != -1:
+            delta = position - lastPositionObj[0]
+            assert delta > 0, "delta position is not positive"
+            numBits = bitLength(delta)
+            assert numBits <= 7 + 15, "positive position delta too large"
+            if numBits <= 7:
+                self.WriteBits(0, 1)
+                self.WriteBits(delta, 7)
+            else:
+                self.WriteBits(1, 1)
+                self.WriteBits(numBits - 8, 4)
+                self.WriteBits(delta, numBits)
+            lastPositionObj[0] = position
+            return
+
+        if self.used != -1:
+            self.elements.append(bitsOrPosition(self.b, self.used, 0))
+            self.used = 0
+            self.b = 0
+
+        self.elements.append(bitsOrPosition(0, 0, position))
+        lastPositionObj[0] = position
+
+    def WriteChar(self, b, w):
+        bits, ok = w.huffman[ord(b)]
+        assert ok, "WriteChar given rune not in Huffman table"
+        w.huffmanCounts[ord(b)] += 1
+        self.WriteBits(bits.bits, bits.numBits)
+
+    def WriteTo(self, w):
+        position = w.position
+
+        if self.used != 0:
+            self.elements.append(bitsOrPosition(self.b, self.used, 0))
+            self.used = 0
+            self.b = 0
+
+        for elem in self.elements:
+            if elem.numBits != 0:
+                w.WriteBits(elem.bits >> (8 - elem.numBits), elem.numBits)
+            else:
+                current = position
+                target = elem.position
+                assert target < current, "reference is not backwards"
+                delta = current - target
+
+                numBits = bitLength(delta)
+
+                assert numBits < 32, "delta is too large"
+
+                w.WriteBits(numBits, 5)
+                w.WriteBits(delta, numBits)
+
+class reversedEntry(object):
+    def __init__(self, bytes, hsts):
+        self.hsts = hsts
+        self.bytes = bytes
+
+class reversedEntries(list):
+    def Len(self):
+        return len(self)
+
+    def Less(self, i, j):
+        return self[i].bytes < self[j].bytes
+
+    def Swap(self, i, j):
+        self[i], self[j] = self[j], self[i]
+
+    def LongestCommonPrefix(self):
+        if len(self) == 0:
+            return None
+
+        prefix = ""
+        i = 0
+        while True:
+            if i > len(self[0].bytes):
+                break
+            candidate = self[0].bytes[i]
+            if candidate == terminalValue:
+                break
+            ok = True
+
+            for ent in self[1:]:
+                if i > len(ent.bytes) or ent.bytes[i] != candidate:
+                    ok = False
+                    break;
+
+            if not ok:
+                break
+
+            prefix += candidate
+            i += 1
+        return prefix
+
+    def RemovePrefix(self, n):
+        for ent in self:
+            ent.bytes = ent.bytes[n:]
+
+def reverseName(name):
+    for r in (ord(x) for x in name):
+        assert 1 <= r <= 126, "byte in name is out of range."
+    return name[::-1] + "\0"
+
+def writeEntries(w, hstsEntries):
+    ents = reversedEntries()
+    for hstsEntry in hstsEntries:
+        ents.append(reversedEntry(reverseName(hstsEntry["name"]),
+                                  hstsEntry))
+
+    # Need to check this! Delete the Less method. Delete the Swap method.
+    ents.sort(key=lambda x: x.bytes)
+
+    return writeDispatchTables(w, ents, 0)
+
+debugging = False
+
+def writeDispatchTables(w, ents, depth):
+    buf = bitBuffer()
+
+    assert len(ents) > 0, "empty ents passed to writeDispatchTables"
+
+    prefix = ents.LongestCommonPrefix()
+    l = len(prefix)
+    while l > 0:
+        buf.WriteBit(1)
+        l -= 1
+    buf.WriteBit(0)
+
+    if len(prefix) > 0:
+        if debugging:
+            for i in range(depth):
+                print(" ", end="")
+        for b in prefix:
+            buf.WriteChar(b, w)
+            if debugging:
+                print(b, end="")
+            depth += 1
+
+        if debugging:
+            print("")
+
+    ents.RemovePrefix(len(prefix))
+    lastPositionObj = [-1]
+    while len(ents) > 0:
+        subents = reversedEntries()
+        b = ents[0].bytes[0]
+        for j in xrange(1, len(ents)):
+            if ents[j].bytes[0] != b:
+                break
+
+        # This will be by ref. Is that right?
+        subents = ents[:j]
+        buf.WriteChar(b, w)
+
+        if debugging:
+            for i in range(depth):
+                print(" ", end="")
+            print("?%s" % b)
+
+        if b == terminalValue:
+            assert len(subents) == 1, "multiple values with the same name"
+            hsts = ents[0].hsts
+### 			hsts := ents[0].hsts
+            assert False, 'untested?, should it be ents[0]["hsts"]?'
+            includeSubdomains = 0
+            if hsts.get("include_subdomains"):
+                includeSubdomains = 1
+            buf.WriteBit(includeSubdomains)
+
+            forceHTTPS = 0
+            if hsts.get("mode") == "force-https":
+                forceHTTPS = 1
+            buf.WriteBit(forceHTTPS)
+
+            if hsts.get("pins", "") == "":
+                buf.WriteBit(0)
+            else:
+                buf.WriteBit(1)
+                pinsId = w.pinsets[hsts["pins"]].index
+                assert pinsId < 15, "too many pinsets"
+                assert pinsId < 15, "too many pinsets"
+                buf.WriteBits(pinsId, 4)
+                domainId = w.domainIds[domainConstant(hsts["name"])]
+                assert domainId < 512, "too many domain ids: %d" % domainId
+                buf.WriteBits(domainId, 9)
+        else:
+            subents.RemovePrefix(1)
+            pos = writeDispatchTables(w, subents, depth + 2)
+            if debugging:
+                for i in range(depth):
+                    print(" ", end="")
+                print("@%d" % pos)
+            buf.WritePosition(lastPositionObj, pos)
+
+        ents = ents[j:]
+
+    buf.WriteChar(endOfTableValue, w)
+
+    position = w.position
+    buf.WriteTo(w)
+    return position
+
+class bitsAndLen(object):
+    def __init__(self, bits, numBits):
+        self.bits = bits
+        self.numBits = numBits
+
+class huffmanNode(object):
+    """huffmanNode represents a node in a Huffman tree, where count is
+    the frequency of the value that the node represents and is used
+    only in tree construction."""
+
+    def __init__(self, value, count, left, right):
+        self.value = value
+        self.count = count
+        self.left = left
+        self.right = right
+
+    def isLeaf(self):
+        return self.left is None and self.right is None
+
+    def toMap(self):
+        """toMap converts the Huffman tree rooted at n into a map from
+        value to the bit sequence for that value."""
+        ret = {}
+        self.fillMap(ret, 0, 0)
+        return ret
+
+    def fillMap(self, m, bits, numBits):
+        """fillMap is a helper function for toMap the recurses down
+        the Huffman tree and fills in entries in m."""
+        if self.isLeaf():
+            m[self.value] = bitsAndLen(bits, numBits)
+        else:
+            newBits = bits << 1
+            self.left.fillMap(m, newBits, numBits + 1)
+            self.right.fillMap(m, newBits | 1, numBits + 1)
+
+    def WriteTo(self, w):
+        """WriteTo serialises the Huffman tree rooted at n to w in a
+        format that can be processed by the Chromium code. See the comments in
+        Chromium about the format."""
+        leftValue = 0
+        rightValue = 0
+        childPosition = 0
+
+        if self.left.isLeaf():
+            leftValue = 128 | self.left.value
+        else:
+            childPosition = self.left.WriteTo(w)
+            assert childPosition < 512, "huffman tree too large"
+            leftValue = int(childPosition / 2)
+
+        if self.right.isLeaf():
+            rightValue = 128 < self.right.value
+        else:
+            childPosition = self.right.WriteTo(w)
+            assert childPosition < 512, "huffman tree too large"
+            rightValue = int(childPosition / 2)
+
+        position = w.count
+        w.WriteByte(leftValue)
+        w.WriteByte(rightValue)
+        return position
+
+class nodeList(list):
+    """list of huffmanNode objects"""
+    def Len(self):
+        return len(self)
+
+    def Less(self, i, j):
+        return self[i].count < self[j].count
+
+    def Swap(self, i, j):
+        self[i], self[j] = self[j], self[i]
+
+# terminalValue indicates the end of a string (which is the beginning of the
+# string since we process it backwards).
+terminalValue = 0
+
+# endOfTableValue is a sentinal value that indicates that there are no more
+# entries in a dispatch table.
+endOfTableValue = 127
+
+def approximateHuffman(entries):
+    """approximateHuffman calculates an approximate frequency table for
+    entries, for use in building a Huffman tree."""
+    useCounts = 129 * [0]
+    for ent in entries:
+        for r in (ord(x) for x in ent["name"]):
+            assert r != 0 and r < 127, "Rune out of range in name"
+            useCounts[r] += 1
+        useCounts[terminalValue] += 1
+        useCounts[endOfTableValue] += 1
+
+    return useCounts
+
+def buildHuffman(useCounts):
+    """buildHuffman builds a Huffman tree using useCounts as a
+    frequency table."""
+    root = None
+    numNonZero = 0
+    for count in useCounts:
+        if count != 0:
+            numNonZero += 1
+
+    nodes = nodeList()
+#    for _ in range(numNonZero):
+#        nodes.append(None))
+
+    for char, count in enumerate(useCounts):
+        if count != 0:
+            nodes.append(huffmanNode(char, count, None, None))
+
+    assert nodes >= 2, "cannot build a tree with a single node"
+    # Need to check this! Delete the Less method. Delete the Swap method.
+    nodes.sort(key=lambda x: x.count)
+
+    while len(nodes) > 1:
+        parent = huffmanNode(0, nodes[0].count + nodes[1].count, nodes[0], nodes[1])
+        nodes = nodes[1:]
+        nodes[0] = parent
+        # Need to check this! Delete the Less method. Delete the Swap method.
+        nodes.sort(key=lambda x: x.count)
+
+    return nodes[0]
 
 if __name__ == '__main__':
     sys.exit(main())
