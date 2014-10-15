@@ -6,10 +6,7 @@ transport_security_state_static.certs into
 transport_security_state_static.h. The input files contain information about
 public key pinning and HTTPS-only sites that is compiled into Chromium.
 
-Run as:
-% go run transport_security_state_static_generate.go transport_security_state_static.json transport_security_state_static.certs
-
-It will write transport_security_state_static.h"""
+Run without arguments for usage information."""
 
 from __future__ import print_function
 
@@ -20,8 +17,14 @@ import os
 import re
 import sys
 
-import pyx509.x509_parse as x509_parse
-from pyasn1.codec.der import encoder as der_encoder
+# This path change is so that we can bundle pyx509 and pyasn1
+# without requiring people to install those libs themselves.
+third_party_path = os.path.abspath(os.path.join(
+    os.path.dirname(__file__),
+    'third_party'))
+sys.path.append(third_party_path)
+import pyx509.x509_parse as x509_parse # pylint: disable=F0401
+from pyasn1.codec.der import encoder as der_encoder  # pylint: disable=F0401
 
 class GenerateException(Exception):
     pass
@@ -29,20 +32,22 @@ class GenerateException(Exception):
 def main():
     """The main entry point. Processes arguments and returns 0 if
     successful or 1 if failed."""
-    if len(sys.argv) != 3:
-        print("Usage: %s <json file> <certificates file>" % sys.argv[0],
-              file=sys.stderr)
+    if len(sys.argv) not in [3, 4]:
+        print("Usage: %s <json file> <certificates file> [output file]" %
+              sys.argv[0], file=sys.stderr)
         return 1
 
     try:
-        process(sys.argv[1], sys.argv[2])
+        process(sys.argv[1:])
     except GenerateException as e:
         print("Conversion failed: %s" % str(e), file=sys.stderr)
         return 1
 
     return 0
 
-def process(jsonFileName, certsFileName):
+def process(arguments):
+    jsonFileName = arguments[0]
+    certsFileName = arguments[1]
     with open(jsonFileName) as jsonFile:
         jsonLines = []
         for pseudoJsonLine in jsonFile: # Includes C++ style comments.
@@ -59,7 +64,12 @@ def process(jsonFileName, certsFileName):
     checkNoopEntries(preloaded["entries"])
     checkDuplicateEntries(preloaded["entries"])
 
-    with open("transport_security_state_static.h", "w") as out:
+    outputFile = "transport_security_state_static.h"
+    if len(arguments) > 2:
+        outputFile = os.path.abspath(arguments[2])
+        if not os.path.exists(os.path.dirname(outputFile)):
+            os.makedirs(os.path.dirname(outputFile))
+    with open(outputFile, "w") as out:
         writeHeader(out)
         writeDomainIds(out, preloaded["domain_ids"])
         writeCertsOutput(out, pins)
@@ -112,10 +122,11 @@ def parseCertsFile(inFile):
                 try:
                     hash = base64.b64decode(line[len(startOfSHA1):])
                 except TypeError:
-                    raise GenerateException("failed to decode hash on line %d." %
-                                    lineNo)
+                    raise GenerateException(
+                        "failed to decode hash on line %d." % lineNo)
                 if len(hash) != 20:
-                    raise GenerateException("bad SHA1 hash length on line %d." % lineNo)
+                    raise GenerateException(
+                        "bad SHA1 hash length on line %d." % lineNo)
                 pins.append({"name": name,
                              "spkiHashFunc": "sha1",
                              "spkiHash": hash})
@@ -126,7 +137,9 @@ def parseCertsFile(inFile):
                 pemCert.append(line)
                 state = INCERT
                 continue
-            raise GenerateException("line %d, after a name, is not a hash nor a certificate" % lineNo)
+            raise GenerateException(
+                "line %d, after a name, is not a hash nor a certificate" %
+                lineNo)
         else:
             assert state == INCERT
             pemCert.append(line)
@@ -186,7 +199,9 @@ def matchNames(name, v):
     firstWord = firstWord.lower()
     lowerV = v.lower();
     if not lowerV.startswith(firstWord):
-        print("The first word (%s) of the certificate name (%s) is not a prefix of the variable name (%s)." % (firstWord, name, lowerV), file=sys.stderr)
+        print(("The first word (%s) of the certificate name (%s) is not "
+               "a prefix of the variable name (%s).") %
+              (firstWord, name, lowerV), file=sys.stderr)
         return False
 
     for i, word in enumerate(words):
@@ -214,7 +229,8 @@ def isImportantWordInCertificateName(w):
 
 
 def checkDuplicatePins(pins):
-    """checkDuplicatePins returns an error if any pins have the same name or the same hash."""
+    """checkDuplicatePins returns an error if any pins have the same
+    name or the same hash."""
     seenNames = set()
     seenHashes = {}
     for pin in pins:
@@ -243,7 +259,8 @@ def checkCertsInPinsets(pinsets, pins):
             raise GenerateException("duplicate pinset name: %s" % name)
         pinsetNames.add(name)
 
-        allPinNames = pinset.get("static_spki_hashes", []) + pinset.get("bad_static_spki_hashes", [])
+        allPinNames = (pinset.get("static_spki_hashes", []) +
+                       pinset.get("bad_static_spki_hashes", []))
         for pinName in allPinNames:
             if not pinName in allPinNames:
                 raise GenerateException("unknown pin: %s" % pinName)
@@ -259,7 +276,8 @@ def checkNoopEntries(entries):
             if e["name"] == "learn.doubleclick.net":
                 # This entry is deliberately used as an exclusion.
                 continue
-            raise GenerateException("Entry for " + e["name"] + " has no mode and no pins")
+            raise GenerateException(
+                "Entry for " + e["name"] + " has no mode and no pins")
 
 def checkDuplicateEntries(entries):
     seen = set()
@@ -275,7 +293,8 @@ def writeHeader(out):
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// This file is automatically generated by transport_security_state_static_generate.go
+// This file is automatically generated by
+// transport_security_state_static_generate.py
 
 #ifndef NET_HTTP_TRANSPORT_SECURITY_STATE_STATIC_H_
 #define NET_HTTP_TRANSPORT_SECURITY_STATE_STATIC_H_
@@ -366,7 +385,13 @@ def writeHSTSEntry(out, entry):
     if entry.get("pins"):
         pinsetName = "k%sPins" % uppercaseFirstLetter(entry["pins"])
         domain = domainConstant(entry["name"])
-    out.write("  {%d, %s, %s, %s, %s, %s },\n" % (dnsLen, str(entry.get("include_subdomains", False)).lower(), dnsName, str(entry.get("mode") == "force-https").lower(), pinsetName, domain))
+    out.write("  {%d, %s, %s, %s, %s, %s },\n" %
+              (dnsLen,
+               str(entry.get("include_subdomains", False)).lower(),
+               dnsName,
+               str(entry.get("mode") == "force-https").lower(),
+               pinsetName,
+               domain))
 
 def writeHSTSOutput(out, hsts):
     out.write("""\
@@ -391,8 +416,10 @@ static const char* const kNoRejectedPublicKeys[] = {
         rejectedListName = "kNoRejectedPublicKeys"
         if pinset.get("bad_static_spki_hashes"):
             rejectedListName = "k%sRejectedCerts" % name
-            writeListOfPins(out, rejectedListName, pinset["bad_static_spki_hashes"])
-        pinsets[pinset["name"]] = pinsetData(pinsetNum, acceptableListName, rejectedListName)
+            writeListOfPins(out, rejectedListName,
+                            pinset["bad_static_spki_hashes"])
+        pinsets[pinset["name"]] = pinsetData(pinsetNum, acceptableListName,
+                                             rejectedListName)
         pinsetNum += 1
 
     out.write("""
@@ -424,7 +451,8 @@ static const struct Pinset kPinsets[] = {
     huffmanMap = root.toMap()
     devNull = open(os.devnull, "w")
     hstsLiteralWriter = cLiteralWriter(devNull)
-    hstsBitWriter = trieWriter(hstsLiteralWriter, pinsets, domainIds, huffmanMap)
+    hstsBitWriter = trieWriter(hstsLiteralWriter, pinsets, domainIds,
+                               huffmanMap)
     writeEntries(hstsBitWriter, hsts["entries"])
     hstsBitWriter.Close()
     origLength = hstsBitWriter.position
@@ -453,7 +481,8 @@ static const uint8 kPreloadedHSTSData[] = {
 """)
 
     hstsLiteralWriter = cLiteralWriter(out)
-    hstsBitWriter = trieWriter(hstsLiteralWriter, pinsets, domainIds, huffmanMap)
+    hstsBitWriter = trieWriter(hstsLiteralWriter, pinsets, domainIds,
+                               huffmanMap)
 
     rootPosition = writeEntries(hstsBitWriter, hsts["entries"])
     hstsBitWriter.Close()
@@ -484,14 +513,14 @@ class cLiteralWriter(object):
             self.out.write("\n")
             self.bytesThisLine = 0
 
-	if self.bytesThisLine == 0:
+        if self.bytesThisLine == 0:
             self.out.write("  ")
-	else:
+        else:
             self.out.write(" ")
 
         self.out.write("0x%0.2x," % b)
-	self.bytesThisLine += 1
-	self.count += 1
+        self.bytesThisLine += 1
+        self.count += 1
 
 class trieWriter(object):
     """trieWriter handles wraps an io.Writer and provides a bit
@@ -863,7 +892,8 @@ def buildHuffman(useCounts):
     nodes.sort(key=lambda x: x.count)
 
     while len(nodes) > 1:
-        parent = huffmanNode(0, nodes[0].count + nodes[1].count, nodes[0], nodes[1])
+        parent = huffmanNode(0, nodes[0].count + nodes[1].count,
+                             nodes[0], nodes[1])
         nodes = nodes[1:]
         nodes[0] = parent
         nodes.sort(key=lambda x: x.count)
