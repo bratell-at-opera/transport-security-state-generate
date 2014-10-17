@@ -23,8 +23,9 @@ third_party_path = os.path.abspath(os.path.join(
     os.path.dirname(__file__),
     'third_party'))
 sys.path.append(third_party_path)
-import pyx509.x509_parse as x509_parse # pylint: disable=F0401
 from pyasn1.codec.der import encoder as der_encoder  # pylint: disable=F0401
+
+import x509decode
 
 class GenerateException(Exception):
     pass
@@ -146,22 +147,17 @@ def parseCertsFile(inFile):
             if not line.startswith(endOfCert):
                 continue
 
-            block = pemDecode(pemCert)
-            cert = x509_parse.x509_parse(block)
-            tbs = cert.tbsCertificate
-            subject = tbs.subject
+            h = hashlib.sha1()
             certName = None
-            subj_attrs = subject.get_attributes()
-            if "CN" in subj_attrs:
-                certName = subj_attrs["CN"][0]
+            cert = x509decode.parsePemCert(pemCert)
+            certName = cert["subjectCN"]
             if not certName:
-                certName = subj_attrs["O"][0] + " " + subj_attrs["OU"][0]
+                certName = cert["subjectO"] + " " + cert["subjectOU"]
+            rawsubjectpublickeyinfo = cert["subjectPublicKeyInfo"]
             if not matchNames(certName, name):
                 raise GenerateException("name failure on line %d:\n%s -> %s" % (
                         lineNo, certName, name))
-            # Calculate SHA1 hash.
-            h = hashlib.sha1()
-            rawsubjectpublickeyinfo = der_encoder.encode(tbs.raw_pub_key_info)
+
             h.update(rawsubjectpublickeyinfo)
             pins.append({"name": name,
                          "cert": cert,
